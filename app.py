@@ -2,9 +2,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
+from urllib.parse import urlencode
 
 import pandas as pd
 import psycopg2
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -13,6 +16,9 @@ from rag_pipeline import RAGPipeline
 load_dotenv()
 
 
+# --------------------
+# Database
+# --------------------
 def build_db_params():
     database_url = os.getenv("DATABASE_URL")
     if database_url:
@@ -53,6 +59,9 @@ def hash_password(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
 
+# --------------------
+# Exam JSON helpers
+# --------------------
 def parse_json_blob(text):
     if not text:
         return None
@@ -70,7 +79,11 @@ def parse_json_blob(text):
 
 
 def format_exam_for_instructor(exam_data):
-    lines = [f"Topic: {exam_data.get('topic', '')}", f"Difficulty: {exam_data.get('difficulty', '')}", ""]
+    lines = [
+        f"Topic: {exam_data.get('topic', '')}",
+        f"Difficulty: {exam_data.get('difficulty', '')}",
+        "",
+    ]
 
     for i, mcq in enumerate(exam_data.get("mcqs", []), start=1):
         lines.append(f"MCQ {i}: {mcq.get('question', '')}")
@@ -95,7 +108,7 @@ def format_exam_for_instructor(exam_data):
     return "\n".join(lines)
 
 
-def format_student_submission(student_data, exam_data=None):
+def format_student_submission(student_data):
     lines = []
 
     mcq_answers = student_data.get("mcq_answers", []) if isinstance(student_data, dict) else []
@@ -123,7 +136,306 @@ def format_student_submission(student_data, exam_data=None):
     return "\n".join(lines)
 
 
-# --- AUTH LOGIC ---
+# --------------------
+# OAuth helpers
+# --------------------
+def get_app_base_url():
+    return os.getenv("APP_BASE_URL", "http://localhost:8501").rstrip("/")
+
+
+def get_oauth_providers():
+    return {
+        "google": {
+            "label": "Continue with Google",
+            "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+            "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "userinfo_url": "https://openidconnect.googleapis.com/v1/userinfo",
+            "scope": "openid email profile",
+        },
+        "github": {
+            "label": "Continue with GitHub",
+            "client_id": os.getenv("GITHUB_CLIENT_ID", ""),
+            "client_secret": os.getenv("GITHUB_CLIENT_SECRET", ""),
+            "authorize_url": "https://github.com/login/oauth/authorize",
+            "token_url": "https://github.com/login/oauth/access_token",
+            "userinfo_url": "https://api.github.com/user",
+            "scope": "read:user user:email",
+        },
+        "facebook": {
+            "label": "Continue with Facebook",
+            "client_id": os.getenv("FACEBOOK_CLIENT_ID", ""),
+            "client_secret": os.getenv("FACEBOOK_CLIENT_SECRET", ""),
+            "authorize_url": "https://www.facebook.com/v22.0/dialog/oauth",
+            "token_url": "https://graph.facebook.com/v22.0/oauth/access_token",
+            "userinfo_url": "https://graph.facebook.com/me",
+            "scope": "email public_profile",
+        },
+    }
+
+
+def oauth_redirect_uri(provider):
+    return f"{get_app_base_url()}/?provider={provider}"
+
+
+def ensure_oauth_state(provider, role):
+    if "oauth_states" not in st.session_state:
+        st.session_state.oauth_states = {}
+
+    if provider not in st.session_state.oauth_states:
+        st.session_state.oauth_states[provider] = {
+            "state": secrets.token_urlsafe(24),
+            "role": role,
+        }
+    else:
+        st.session_state.oauth_states[provider]["role"] = role
+
+    return st.session_state.oauth_states[provider]["state"]
+
+
+def build_authorize_url(provider, cfg, role):
+    state = ensure_oauth_state(provider, role)
+    params = {
+        "client_id": cfg["client_id"],
+        "redirect_uri": oauth_redirect_uri(provider),
+        "response_type": "code",
+        "scope": cfg["scope"],
+        "state": state,
+    }
+    return f"{cfg['authorize_url']}?{urlencode(params)}"
+
+
+def exchange_code_for_token(provider, cfg, code):
+    redirect_uri = oauth_redirect_uri(provider)
+
+    if provider == "github":
+        resp = requests.post(
+            cfg["token_url"],
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError(f"GitHub token error: {data}")
+        return token
+
+    if provider == "google":
+        resp = requests.post(
+            cfg["token_url"],
+            data={
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError(f"Google token error: {data}")
+        return token
+
+    if provider == "facebook":
+        resp = requests.get(
+            cfg["token_url"],
+            params={
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError(f"Facebook token error: {data}")
+        return token
+
+    raise RuntimeError("Unsupported provider")
+
+
+def get_oauth_profile(provider, cfg, access_token):
+    if provider == "google":
+        resp = requests.get(
+            cfg["userinfo_url"],
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "provider": "google",
+            "subject": str(data.get("sub", "")),
+            "email": data.get("email", ""),
+            "display_name": data.get("name", "") or data.get("email", ""),
+        }
+
+    if provider == "github":
+        resp = requests.get(
+            cfg["userinfo_url"],
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        user = resp.json()
+
+        email = user.get("email")
+        if not email:
+            email_resp = requests.get(
+                "https://api.github.com/user/emails",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=20,
+            )
+            email_resp.raise_for_status()
+            emails = email_resp.json()
+            primary = next((e for e in emails if e.get("primary") and e.get("verified")), None)
+            if primary:
+                email = primary.get("email")
+
+        return {
+            "provider": "github",
+            "subject": str(user.get("id", "")),
+            "email": email or "",
+            "display_name": user.get("name") or user.get("login") or email or "github_user",
+        }
+
+    if provider == "facebook":
+        resp = requests.get(
+            cfg["userinfo_url"],
+            params={
+                "fields": "id,name,email",
+                "access_token": access_token,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "provider": "facebook",
+            "subject": str(data.get("id", "")),
+            "email": data.get("email", ""),
+            "display_name": data.get("name") or data.get("email") or "facebook_user",
+        }
+
+    raise RuntimeError("Unsupported provider")
+
+
+def login_or_create_oauth_user(profile, fallback_role="student"):
+    provider = profile.get("provider", "")
+    subject = profile.get("subject", "")
+    email = profile.get("email", "")
+    display_name = profile.get("display_name", "")
+
+    if not provider or not subject:
+        raise RuntimeError("Invalid OAuth profile")
+
+    username_base = (email or display_name or f"{provider}_user").strip()
+    username_base = re.sub(r"\s+", "_", username_base)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id, username, role FROM users WHERE oauth_provider=%s AND oauth_subject=%s",
+        (provider, subject),
+    )
+    user = cur.fetchone()
+    if user:
+        cur.close()
+        conn.close()
+        return user
+
+    role = fallback_role if fallback_role in ("student", "instructor") else "student"
+
+    username = username_base
+    suffix = 1
+    while True:
+        cur.execute("SELECT 1 FROM users WHERE username=%s", (username,))
+        if not cur.fetchone():
+            break
+        suffix += 1
+        username = f"{username_base}_{suffix}"
+
+    random_pw = hash_password(secrets.token_hex(24))
+
+    cur.execute(
+        """
+        INSERT INTO users (username, password, role, oauth_provider, oauth_subject, email)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id, username, role
+        """,
+        (username, random_pw, role, provider, subject, email or None),
+    )
+    created = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return created
+
+
+def handle_oauth_callback_if_present():
+    qp = st.query_params
+    provider = qp.get("provider")
+    code = qp.get("code")
+    state = qp.get("state")
+
+    if not provider or not code:
+        return
+
+    providers = get_oauth_providers()
+    cfg = providers.get(provider)
+    if not cfg:
+        st.error("Unknown OAuth provider in callback.")
+        st.query_params.clear()
+        return
+
+    expected_state = (
+        st.session_state.get("oauth_states", {}).get(provider, {}).get("state")
+    )
+    if not expected_state or state != expected_state:
+        st.error("OAuth state mismatch. Please retry login.")
+        st.query_params.clear()
+        return
+
+    if not cfg["client_id"] or not cfg["client_secret"]:
+        st.error(f"{provider.title()} OAuth is not configured in .env")
+        st.query_params.clear()
+        return
+
+    try:
+        access_token = exchange_code_for_token(provider, cfg, code)
+        profile = get_oauth_profile(provider, cfg, access_token)
+        selected_role = (
+            st.session_state.get("oauth_states", {}).get(provider, {}).get("role", "student")
+        )
+        user = login_or_create_oauth_user(profile, fallback_role=selected_role)
+
+        st.session_state.logged_in = True
+        st.session_state.user = {"id": user[0], "username": user[1], "role": user[2]}
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"OAuth login failed: {e}")
+        st.query_params.clear()
+
+
+# --------------------
+# Password auth helpers (kept as fallback)
+# --------------------
 def login_user(username, password):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -137,15 +449,42 @@ def login_user(username, password):
     return user
 
 
+# --------------------
+# Session bootstrap
+# --------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.user = None
 if "rag" not in st.session_state:
     st.session_state.rag = RAGPipeline("pdfs")
 
-# --- UI LOGIC ---
+handle_oauth_callback_if_present()
+
+
+# --------------------
+# UI
+# --------------------
 if not st.session_state.logged_in:
     st.title("AI University Portal")
+
+    st.subheader("Social Sign In / Sign Up")
+    selected_role = st.selectbox(
+        "Role for first-time social account",
+        ["student", "instructor"],
+        index=0,
+    )
+
+    providers = get_oauth_providers()
+    for provider in ["google", "github", "facebook"]:
+        cfg = providers[provider]
+        if cfg["client_id"] and cfg["client_secret"]:
+            auth_url = build_authorize_url(provider, cfg, selected_role)
+            st.link_button(cfg["label"], auth_url)
+        else:
+            st.caption(f"{provider.title()} OAuth not configured in .env")
+
+    st.divider()
+    st.subheader("Local Login (Fallback)")
     choice = st.selectbox("Action", ["Login", "Sign Up"])
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
@@ -161,7 +500,7 @@ if not st.session_state.logged_in:
                     (username, hash_password(password), role),
                 )
                 conn.commit()
-                st.success("Created! Please login.")
+                st.success("Created. Please login.")
             except Exception as e:
                 st.error(f"Registration Error: {e}")
             finally:
@@ -184,6 +523,7 @@ else:
     st.sidebar.title(f"Welcome, {user['username']}")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
+        st.session_state.user = None
         st.rerun()
 
     if user["role"] == "instructor":
@@ -208,7 +548,9 @@ else:
                     )
                 else:
                     stored_content = text
-                    st.warning("Generated content is not structured JSON; student form mode may not work for this exam.")
+                    st.warning(
+                        "Generated content is not structured JSON; student form mode may not work for this exam."
+                    )
                     st.text_area("Preview", text, height=300)
 
                 conn = get_db_connection()
@@ -253,7 +595,7 @@ else:
                     if student_data:
                         c2.text_area(
                             "Student Submission",
-                            format_student_submission(student_data, exam_data),
+                            format_student_submission(student_data),
                             height=260,
                             key=f"s{s_id}",
                         )
@@ -355,7 +697,7 @@ else:
                 if submitted_structured:
                     st.text_area(
                         "Your Submission",
-                        format_student_submission(submitted_structured, exam_data),
+                        format_student_submission(submitted_structured),
                         height=260,
                     )
                 else:

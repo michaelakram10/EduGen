@@ -48,13 +48,17 @@ def create_tables():
             "CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS exams (id SERIAL PRIMARY KEY, topic TEXT NOT NULL, content TEXT NOT NULL, difficulty TEXT, created_by INTEGER REFERENCES users(id))",
             "CREATE TABLE IF NOT EXISTS submissions (id SERIAL PRIMARY KEY, exam_id INTEGER REFERENCES exams(id), student_id INTEGER REFERENCES users(id), student_answers TEXT, ai_feedback TEXT, numerical_score INTEGER, submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_provider TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_subject TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_oauth_identity_uniq ON users(oauth_provider, oauth_subject)",
         ]
 
         for command in commands:
             cur.execute(command)
 
         conn.commit()
-        print("Tables created successfully.")
+        print("Tables created/updated successfully.")
         cur.close()
         conn.close()
     except Exception as e:
