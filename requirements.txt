@@ -1,0 +1,17 @@
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-core==0.2.38
+langchain-huggingface==0.0.3
+
+sentence-transformers
+faiss-cpu
+pymupdf
+transformers
+accelerate
+torch
+
+streamlit
+pandas
+psycopg2-binary
+groq
+python-dotenv

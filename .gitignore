@@ -1,0 +1,24 @@
+# Ignore Virtual Environments
+venv/
+.venv/
+env/
+bin/
+lib/
+.env
+rag_env/
+pdfs/
+# Ignore Large Data/Models
+*.csv
+*.pkl
+*.zip
+*.parquet
+
+# MacOS system files
+.DS_Store
+
+.venv/
+rag_env/
+pdfs/
+faiss_index/
+__pycache__/
+.env
